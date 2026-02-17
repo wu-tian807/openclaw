@@ -188,6 +188,8 @@ export type AgentDefaultsConfig = {
   /** Human-like delay between block replies. */
   humanDelay?: HumanDelayConfig;
   timeoutSeconds?: number;
+  /** Maximum tool-call rounds per agent run. Soft-enforced via steer messages (no hard abort). */
+  maxTurnsPerRun?: number;
   /** Max inbound media size in MB for agent-visible attachments (text note or future image attach). */
   mediaMaxMb?: number;
   /**

@@ -1,9 +1,10 @@
-import fs from "node:fs/promises";
-import os from "node:os";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { ImageContent } from "@mariozechner/pi-ai";
 import { streamSimple } from "@mariozechner/pi-ai";
 import { createAgentSession, SessionManager, SettingsManager } from "@mariozechner/pi-coding-agent";
+import fs from "node:fs/promises";
+import os from "node:os";
+import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 import { resolveHeartbeatPrompt } from "../../../auto-reply/heartbeat.js";
 import { resolveChannelCapabilities } from "../../../config/channel-capabilities.js";
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
@@ -106,7 +107,6 @@ import {
   shouldFlagCompactionTimeout,
 } from "./compaction-timeout.js";
 import { detectAndLoadPromptImages } from "./images.js";
-import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 
 export function injectHistoryImagesIntoMessages(
   messages: AgentMessage[],
@@ -803,6 +803,52 @@ export async function runEmbeddedAttempt(
       };
       setActiveEmbeddedRun(params.sessionId, queueHandle, params.sessionKey);
 
+      // ── Turn guard: soft-limit tool rounds per run via steer messages ──
+      // Uses a two-phase approach: at 80% of maxTurnsPerRun, nudge the agent
+      // to start wrapping up; at 100%, suggest stopping. Never hard-aborts.
+      const maxTurnsPerRun = (
+        params.config?.agents?.defaults as Record<string, unknown> | undefined
+      )?.maxTurnsPerRun as number | undefined;
+      let turnGuardCount = 0;
+      let turnGuardSteeredAtThreshold = false;
+      let turnGuardSteeredAtLimit = false;
+      const unsubscribeTurnGuard = maxTurnsPerRun
+        ? activeSession.agent.subscribe((evt) => {
+            if (evt.type !== "turn_end") {
+              return;
+            }
+            turnGuardCount++;
+            const threshold = Math.ceil(maxTurnsPerRun * 0.8);
+
+            if (
+              turnGuardCount >= threshold &&
+              !turnGuardSteeredAtThreshold &&
+              turnGuardCount < maxTurnsPerRun
+            ) {
+              turnGuardSteeredAtThreshold = true;
+              log.debug(
+                `[turn-guard] threshold reached: runId=${params.runId} turn=${turnGuardCount}/${maxTurnsPerRun}`,
+              );
+              void activeSession.steer(
+                `[Turn ${turnGuardCount}/${maxTurnsPerRun}] You are approaching the tool round limit for this run. ` +
+                  `Start wrapping up your current task and summarize your progress. ` +
+                  `If you are stuck or need help, ask the user directly instead of continuing to try.`,
+              );
+            } else if (turnGuardCount >= maxTurnsPerRun && !turnGuardSteeredAtLimit) {
+              turnGuardSteeredAtLimit = true;
+              log.debug(
+                `[turn-guard] limit reached: runId=${params.runId} turn=${turnGuardCount}/${maxTurnsPerRun}`,
+              );
+              void activeSession.steer(
+                `[Turn ${turnGuardCount}/${maxTurnsPerRun}] You have reached the tool round limit for this run. ` +
+                  `Please stop using tools now and report your current status. ` +
+                  `A follow-up run will continue where you left off. ` +
+                  `If you encountered problems, describe them clearly so the user can help.`,
+              );
+            }
+          })
+        : undefined;
+
       let abortWarnTimer: NodeJS.Timeout | undefined;
       const isProbeSession = params.sessionId?.startsWith("probe-") ?? false;
       const abortTimer = setTimeout(
@@ -1182,6 +1228,7 @@ export async function runEmbeddedAttempt(
             `run cleanup: runId=${params.runId} sessionId=${params.sessionId} aborted=${aborted} timedOut=${timedOut}`,
           );
         }
+        unsubscribeTurnGuard?.();
         try {
           unsubscribe();
         } catch (err) {
